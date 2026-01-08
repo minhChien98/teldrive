@@ -53,9 +53,9 @@ func (a *apiService) AuthLogin(ctx context.Context, session *api.SessionCreate) 
 		UserName:  session.UserName,
 		IsPremium: session.IsPremium,
 		RegisteredClaims: jwt.RegisteredClaims{
-			Subject:   strconv.FormatInt(session.UserId, 10),
-			IssuedAt:  jwt.NewNumericDate(now),
-			ExpiresAt: jwt.NewNumericDate(now.Add(a.cnf.JWT.SessionTime)),
+			Subject:  strconv.FormatInt(session.UserId, 10),
+			IssuedAt: jwt.NewNumericDate(now),
+			// No ExpiresAt - token never expires
 		}}
 
 	tokenhash := md5.Sum([]byte(session.Session))
@@ -125,7 +125,7 @@ func (a *apiService) AuthLogin(ctx context.Context, session *api.SessionCreate) 
 		Session: session.Session, SessionDate: auth.DateCreated}).Error; err != nil {
 		return nil, &apiError{err: err}
 	}
-	return &api.AuthLoginNoContent{SetCookie: setCookie(authCookieName, jwtToken, int(a.cnf.JWT.SessionTime.Seconds()))}, nil
+	return &api.AuthLoginNoContent{SetCookie: setCookie(authCookieName, jwtToken, 10*365*24*60*60)}, nil // 10 years
 }
 
 func (a *apiService) AuthLogout(ctx context.Context) (*api.AuthLogoutNoContent, error) {
@@ -154,8 +154,6 @@ func (a *apiService) AuthSession(ctx context.Context, params api.AuthSessionPara
 
 	now := time.Now().UTC()
 
-	newExpires := now.Add(a.cnf.JWT.SessionTime)
-
 	userId, _ := strconv.ParseInt(claims.Subject, 10, 64)
 
 	session := api.Session{
@@ -163,18 +161,17 @@ func (a *apiService) AuthSession(ctx context.Context, params api.AuthSessionPara
 		UserName: claims.UserName,
 		UserId:   userId,
 		Hash:     claims.Hash,
-		Expires:  newExpires}
+		Expires:  now.Add(100 * 365 * 24 * time.Hour)} // Far future for API response
 
 	claims.IssuedAt = jwt.NewNumericDate(now)
-
-	claims.ExpiresAt = jwt.NewNumericDate(newExpires)
+	claims.ExpiresAt = nil // Token never expires
 
 	jweToken, err := auth.Encode(a.cnf.JWT.Secret, claims)
 
 	if err != nil {
 		return &api.AuthSessionNoContent{}, nil
 	}
-	return &api.SessionHeaders{SetCookie: setCookie(authCookieName, jweToken, int(a.cnf.JWT.SessionTime.Seconds())),
+	return &api.SessionHeaders{SetCookie: setCookie(authCookieName, jweToken, 10*365*24*60*60), // 10 years
 		Response: session}, nil
 }
 

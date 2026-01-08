@@ -3,6 +3,7 @@ package services
 import (
 	"context"
 	"net/http"
+	"strings"
 	"time"
 
 	"github.com/go-faster/errors"
@@ -122,6 +123,10 @@ type extendedMiddleware struct {
 func (m *extendedMiddleware) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	route, ok := m.next.FindRoute(r.Method, r.URL.Path)
 	if !ok {
+		// Handle custom /view routes not in OpenAPI spec
+		if m.handleViewRoutes(w, r) {
+			return
+		}
 		m.next.ServeHTTP(w, r)
 		return
 	}
@@ -139,6 +144,46 @@ func (m *extendedMiddleware) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	m.next.ServeHTTP(w, r)
+}
+
+// handleViewRoutes handles /view endpoints for fast file preview via Telegram CDN.
+// Returns true if the route was handled, false otherwise.
+//
+// Supported routes:
+//   - GET /files/{id}/view
+//   - GET /files/{id}/view/{name}
+//   - GET /shares/{shareId}/files/{fileId}/view
+//   - GET /shares/{shareId}/files/{fileId}/view/{name}
+func (m *extendedMiddleware) handleViewRoutes(w http.ResponseWriter, r *http.Request) bool {
+	if r.Method != http.MethodGet {
+		return false
+	}
+
+	path := r.URL.Path
+
+	// Pattern: /files/{id}/view or /files/{id}/view/{name}
+	if strings.HasPrefix(path, "/files/") && strings.Contains(path, "/view") {
+		parts := strings.Split(strings.TrimPrefix(path, "/files/"), "/")
+		if len(parts) >= 2 && parts[1] == "view" {
+			fileId := parts[0]
+			m.srv.FilesView(w, r, fileId, 0)
+			return true
+		}
+	}
+
+	// Pattern: /shares/{shareId}/files/{fileId}/view or /shares/{shareId}/files/{fileId}/view/{name}
+	if strings.HasPrefix(path, "/shares/") && strings.Contains(path, "/view") {
+		parts := strings.Split(strings.TrimPrefix(path, "/shares/"), "/")
+		// Expected: {shareId}/files/{fileId}/view[/{name}]
+		if len(parts) >= 4 && parts[1] == "files" && parts[3] == "view" {
+			shareId := parts[0]
+			fileId := parts[2]
+			m.srv.SharesView(w, r, shareId, fileId)
+			return true
+		}
+	}
+
+	return false
 }
 
 func NewExtendedMiddleware(next *api.Server, srv *extendedService) *extendedMiddleware {

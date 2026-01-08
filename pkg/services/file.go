@@ -4,6 +4,7 @@ import (
 	"context"
 	"crypto/rand"
 	"encoding/binary"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
@@ -903,4 +904,283 @@ func mapParts(_parts []api.Part) []api.Part {
 		return p
 	})
 
+}
+
+// FilesView handles fast file preview/view requests via Telegram Bot API CDN.
+//
+// This endpoint provides significantly faster file loading compared to the standard
+// download endpoint by leveraging Telegram's CDN infrastructure directly.
+//
+// How it works:
+//  1. Fetches file metadata from database
+//  2. Retrieves the document from Telegram channel
+//  3. Encodes document to Bot API file_id format
+//  4. Calls Bot API getFile to obtain CDN file_path
+//  5. Redirects client to Telegram CDN URL for direct download
+//
+// Limitations:
+//   - Maximum file size: 20MB (Bot API limitation)
+//   - Encrypted files are not supported (must use /download instead)
+//   - Single-part files only (multi-part files use /download)
+//   - Requires at least one bot token configured
+//
+// Response modes (controlled by 'mode' query parameter):
+//   - mode=redirect (default): Returns HTTP 302 redirect to CDN URL
+//   - mode=url: Returns JSON with CDN URL for client-side handling
+//
+// Cache:
+//   - CDN URLs are cached for 50 minutes (Telegram guarantees 1 hour validity)
+//   - Cache key: "botapi:file:{file_id}"
+//
+// URL: GET /api/files/:id/view
+// URL: GET /api/files/:id/view/:name (with filename)
+//
+// Query Parameters:
+//   - mode: Response mode ("redirect" or "url", default: "redirect")
+//   - hash: Authentication hash (alternative to JWT cookie)
+//
+// Response (mode=redirect):
+//
+//	HTTP 302 Found
+//	Location: https://api.telegram.org/file/bot<token>/<file_path>
+//
+// Response (mode=url):
+//
+//	{
+//	  "url": "https://api.telegram.org/file/bot<token>/<file_path>",
+//	  "expires_in": 3600,
+//	  "file_name": "example.pdf",
+//	  "file_size": 1048576,
+//	  "mime_type": "application/pdf"
+//	}
+//
+// Error Responses:
+//   - 400 Bad Request: File is encrypted or too large (>20MB)
+//   - 401 Unauthorized: Missing or invalid authentication
+//   - 404 Not Found: File not found
+//   - 500 Internal Server Error: Failed to get CDN URL
+func (e *extendedService) FilesView(w http.ResponseWriter, r *http.Request, fileId string, userId int64) {
+	ctx := r.Context()
+	logger := logging.FromContext(ctx)
+
+	var (
+		session *models.Session
+		err     error
+		user    *types.JWTClaims
+	)
+
+	// Authentication (same as FilesStream)
+	if userId == 0 {
+		authHash := r.URL.Query().Get("hash")
+		if authHash == "" {
+			cookie, err := r.Cookie(authCookieName)
+			if err != nil {
+				http.Error(w, "missing token or hash", http.StatusUnauthorized)
+				return
+			}
+			user, err = auth.VerifyUser(e.api.db, e.api.cache, e.api.cnf.JWT.Secret, cookie.Value)
+			if err != nil {
+				http.Error(w, "invalid token", http.StatusUnauthorized)
+				return
+			}
+			userId, _ := strconv.ParseInt(user.Subject, 10, 64)
+			session = &models.Session{UserId: userId, Session: user.TgSession}
+		} else {
+			session, err = auth.GetSessionByHash(e.api.db, e.api.cache, authHash)
+			if err != nil {
+				http.Error(w, "invalid hash", http.StatusBadRequest)
+				return
+			}
+		}
+	} else {
+		session = &models.Session{UserId: userId}
+	}
+
+	// Fetch file metadata
+	file, err := cache.Fetch(e.api.cache, cache.Key("files", fileId), 0, func() (*models.File, error) {
+		var result models.File
+		if err := e.api.db.Model(&result).Where("id = ?", fileId).First(&result).Error; err != nil {
+			return nil, err
+		}
+		return &result, nil
+	})
+
+	if err != nil {
+		logger.Error("file not found", zap.String("fileId", fileId), zap.Error(err))
+		http.Error(w, "file not found", http.StatusNotFound)
+		return
+	}
+
+	// Validate file for Bot API usage
+	if file.Encrypted != nil && *file.Encrypted {
+		logger.Debug("file is encrypted, cannot use view endpoint", zap.String("fileId", fileId))
+		http.Error(w, "encrypted files are not supported, use /download instead", http.StatusBadRequest)
+		return
+	}
+
+	if file.Size != nil && *file.Size > tgc.MaxBotAPIFileSize {
+		logger.Debug("file too large for Bot API",
+			zap.String("fileId", fileId),
+			zap.Int64("size", *file.Size),
+			zap.Int64("maxSize", tgc.MaxBotAPIFileSize))
+		http.Error(w, fmt.Sprintf("file size exceeds Bot API limit (%dMB), use /download instead",
+			tgc.MaxBotAPIFileSize/(1024*1024)), http.StatusBadRequest)
+		return
+	}
+
+	if file.Parts == nil || len(*file.Parts) == 0 {
+		http.Error(w, "file has no parts", http.StatusBadRequest)
+		return
+	}
+
+	if len(*file.Parts) > 1 {
+		logger.Debug("multi-part file, cannot use view endpoint", zap.String("fileId", fileId))
+		http.Error(w, "multi-part files are not supported, use /download instead", http.StatusBadRequest)
+		return
+	}
+
+	// Get bot tokens from file owner (bots are added to owner's channel)
+	// This is important for shared files - we need owner's bots to access the channel
+	fileOwnerUserId := file.UserId
+	tokens, err := e.api.channelManager.BotTokens(fileOwnerUserId)
+	if err != nil {
+		logger.Error("failed to get bot tokens", zap.Error(err))
+		http.Error(w, "failed to get bot tokens", http.StatusInternalServerError)
+		return
+	}
+
+	if len(tokens) == 0 {
+		http.Error(w, "no bot tokens configured, use /download instead", http.StatusBadRequest)
+		return
+	}
+
+	// Get bot token using round-robin (load balancing across bots)
+	e.api.worker.Set(tokens, fileOwnerUserId)
+	token, _ := e.api.worker.Next(fileOwnerUserId)
+
+	// Get CDN URL with caching (avoids MTProto calls on cache hit)
+	cdnURL, err := tgc.GetCachedViewURL(ctx, e.api.cache, fileId, token, func() (*tg.Document, error) {
+		// This function only runs on cache miss
+		var document *tg.Document
+
+		middlewares := tgc.NewMiddleware(&e.api.cnf.TG, tgc.WithFloodWait(), tgc.WithRateLimit())
+		client, err := tgc.BotClient(ctx, e.api.db, e.api.cache, &e.api.cnf.TG, token, middlewares...)
+		if err != nil {
+			return nil, fmt.Errorf("failed to create bot client: %w", err)
+		}
+
+		err = tgc.RunWithAuth(ctx, client, token, func(ctx context.Context) error {
+			partId := (*file.Parts)[0].ID
+			channelId := *file.ChannelId
+
+			channel, err := tgc.GetChannelById(ctx, client.API(), channelId)
+			if err != nil {
+				return fmt.Errorf("failed to get channel: %w", err)
+			}
+
+			messageRequest := tg.ChannelsGetMessagesRequest{
+				Channel: channel,
+				ID:      []tg.InputMessageClass{&tg.InputMessageID{ID: partId}},
+			}
+
+			res, err := client.API().ChannelsGetMessages(ctx, &messageRequest)
+			if err != nil {
+				return fmt.Errorf("failed to get message: %w", err)
+			}
+
+			messages, ok := res.(*tg.MessagesChannelMessages)
+			if !ok || len(messages.Messages) == 0 {
+				return fmt.Errorf("message not found")
+			}
+
+			msg, ok := messages.Messages[0].(*tg.Message)
+			if !ok {
+				return fmt.Errorf("invalid message type")
+			}
+
+			media, ok := msg.Media.(*tg.MessageMediaDocument)
+			if !ok {
+				return fmt.Errorf("message has no document")
+			}
+
+			doc, ok := media.Document.(*tg.Document)
+			if !ok {
+				return fmt.Errorf("invalid document type")
+			}
+
+			document = doc
+			return nil
+		})
+
+		if err != nil {
+			return nil, err
+		}
+
+		return document, nil
+	})
+
+	if err != nil {
+		logger.Error("failed to get CDN URL", zap.String("fileId", fileId), zap.Error(err))
+		http.Error(w, "failed to get CDN URL: "+err.Error(), http.StatusInternalServerError)
+		return
+	}
+
+	// Response mode
+	mode := r.URL.Query().Get("mode")
+	if mode == "" {
+		mode = "redirect"
+	}
+
+	// Set cache headers for browser caching (images can be cached)
+	// Cache for 50 minutes (CDN URL valid for 1 hour)
+	w.Header().Set("Cache-Control", "public, max-age=3000")
+	w.Header().Set("ETag", fmt.Sprintf("\"%s\"", md5.FromString(fileId)))
+
+	switch mode {
+	case "url":
+		// Return JSON with URL
+		w.Header().Set("Content-Type", "application/json")
+		response := map[string]interface{}{
+			"url":        cdnURL,
+			"expires_in": 3000, // ~50 minutes
+			"file_name":  file.Name,
+			"mime_type":  file.MimeType,
+		}
+		if file.Size != nil {
+			response["file_size"] = *file.Size
+		}
+		json.NewEncoder(w).Encode(response)
+
+	default: // redirect
+		// HTTP 302 redirect to CDN (browser will follow and load image directly)
+		http.Redirect(w, r, cdnURL, http.StatusFound)
+	}
+
+	logger.Debug("view request completed",
+		zap.String("fileId", fileId),
+		zap.String("mode", mode),
+		zap.String("fileName", file.Name))
+}
+
+// SharesView handles fast file view for shared files via Bot API CDN.
+//
+// This is the shared file variant of FilesView. It validates the share
+// authentication before delegating to FilesView.
+//
+// URL: GET /api/shares/:shareId/files/:fileId/view
+// URL: GET /api/shares/:shareId/files/:fileId/view/:name
+//
+// For detailed documentation, see FilesView.
+func (e *extendedService) SharesView(w http.ResponseWriter, r *http.Request, shareId, fileId string) {
+	share, err := e.api.validFileShare(r, shareId)
+	if err != nil && errors.Is(err, ErrEmptyAuth) {
+		w.Header().Set("WWW-Authenticate", `Basic realm="Restricted"`)
+		http.Error(w, "Unauthorized", http.StatusUnauthorized)
+		return
+	}
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusUnauthorized)
+		return
+	}
+	e.FilesView(w, r, fileId, share.UserId)
 }
