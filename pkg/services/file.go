@@ -963,12 +963,6 @@ func (e *extendedService) FilesView(w http.ResponseWriter, r *http.Request, file
 	ctx := r.Context()
 	logger := logging.FromContext(ctx)
 
-	var (
-		session *models.Session
-		err     error
-		user    *types.JWTClaims
-	)
-
 	// Authentication (same as FilesStream)
 	if userId == 0 {
 		authHash := r.URL.Query().Get("hash")
@@ -978,22 +972,18 @@ func (e *extendedService) FilesView(w http.ResponseWriter, r *http.Request, file
 				http.Error(w, "missing token or hash", http.StatusUnauthorized)
 				return
 			}
-			user, err = auth.VerifyUser(e.api.db, e.api.cache, e.api.cnf.JWT.Secret, cookie.Value)
+			_, err = auth.VerifyUser(e.api.db, e.api.cache, e.api.cnf.JWT.Secret, cookie.Value)
 			if err != nil {
 				http.Error(w, "invalid token", http.StatusUnauthorized)
 				return
 			}
-			userId, _ := strconv.ParseInt(user.Subject, 10, 64)
-			session = &models.Session{UserId: userId, Session: user.TgSession}
 		} else {
-			session, err = auth.GetSessionByHash(e.api.db, e.api.cache, authHash)
+			_, err := auth.GetSessionByHash(e.api.db, e.api.cache, authHash)
 			if err != nil {
 				http.Error(w, "invalid hash", http.StatusBadRequest)
 				return
 			}
 		}
-	} else {
-		session = &models.Session{UserId: userId}
 	}
 
 	// Fetch file metadata
